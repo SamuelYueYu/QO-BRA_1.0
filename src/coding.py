@@ -82,6 +82,108 @@ def issame(str1, str2):
         same = True
     return same
 
+# =============================================
+# FAST NOVELTY CHECKING WITH K-MER FINGERPRINTS
+# =============================================
+# These functions enable O(1) pre-filtering before expensive LCS computation
+
+def get_kmers(seq, k=4):
+    """
+    Extract all k-mers from a sequence.
+    
+    Parameters:
+    - seq: Input sequence string
+    - k: Length of k-mers (default 4)
+    
+    Returns:
+    - Set of k-mer strings
+    """
+    if len(seq) < k:
+        return set()
+    return {seq[i:i+k] for i in range(len(seq) - k + 1)}
+
+def build_kmer_index(sequences, k=4):
+    """
+    Build an inverted index from k-mers to sequence indices.
+    
+    This enables fast candidate retrieval for novelty checking.
+    Only sequences sharing k-mers with the query need LCS comparison.
+    
+    Parameters:
+    - sequences: List of training sequences
+    - k: K-mer length (default 4)
+    
+    Returns:
+    - kmer_to_seqs: Dict mapping k-mers to sets of sequence indices
+    - seq_kmers: List of k-mer sets for each sequence
+    """
+    kmer_to_seqs = {}
+    seq_kmers = []
+    
+    for idx, seq in enumerate(sequences):
+        kmers = get_kmers(seq, k)
+        seq_kmers.append(kmers)
+        for kmer in kmers:
+            if kmer not in kmer_to_seqs:
+                kmer_to_seqs[kmer] = set()
+            kmer_to_seqs[kmer].add(idx)
+    
+    return kmer_to_seqs, seq_kmers
+
+def check_novelty_fast(query_seq, training_seqs, kmer_index=None, seq_kmers=None, k=4, min_shared_ratio=0.05):
+    """
+    Fast novelty check using k-mer filtering + early-termination LCS.
+    
+    This is much faster than checking LCS against all training sequences:
+    1. Extract k-mers from query
+    2. Find candidate sequences that share k-mers (using inverted index)
+    3. Only run LCS on candidates with significant k-mer overlap
+    4. Early termination: return False as soon as a match is found
+    
+    Parameters:
+    - query_seq: The generated sequence to check
+    - training_seqs: List of training sequences
+    - kmer_index: Precomputed k-mer to sequence index mapping
+    - seq_kmers: Precomputed k-mer sets for training sequences
+    - k: K-mer length
+    - min_shared_ratio: Minimum k-mer overlap ratio to consider as candidate
+    
+    Returns:
+    - Boolean indicating if sequence is novel (True = novel, False = similar to training)
+    """
+    if len(query_seq) < k:
+        return True  # Very short sequences are considered novel
+    
+    query_kmers = get_kmers(query_seq, k)
+    
+    if kmer_index is None or seq_kmers is None:
+        # Fallback to slow method if index not provided
+        return not any(issame(seq, query_seq) for seq in training_seqs)
+    
+    # Find candidate sequences that share k-mers
+    candidate_indices = set()
+    for kmer in query_kmers:
+        if kmer in kmer_index:
+            candidate_indices.update(kmer_index[kmer])
+    
+    # Score candidates by k-mer overlap
+    candidates_with_scores = []
+    for idx in candidate_indices:
+        shared = len(query_kmers & seq_kmers[idx])
+        # Quick rejection: if too few shared k-mers, skip LCS
+        if shared / max(len(query_kmers), len(seq_kmers[idx])) >= min_shared_ratio:
+            candidates_with_scores.append((idx, shared))
+    
+    # Sort by overlap (most overlapping first for faster early termination)
+    candidates_with_scores.sort(key=lambda x: -x[1])
+    
+    # Check candidates with LCS (early termination)
+    for idx, _ in candidates_with_scores:
+        if issame(training_seqs[idx], query_seq):
+            return False  # Found a match - not novel
+    
+    return True  # No matches found - novel sequence
+
 def prep(metal):
     """
     Prepare and filter molecular sequences for a specific sequence type.
@@ -115,6 +217,7 @@ def prep(metal):
                 if len(lines[i]) > 0:
                     s += lines[i]
             temp.append(s)
+            
             # Store PDB code (first 4 characters of filename)
             PDBcodes[s] = filename[:4]
     
@@ -331,8 +434,8 @@ def decode_amino_acid_sequence(code, ftc, head):
         
         # Find the closest matching amplitude in the dictionary
         for k in ftc.keys():
-            if abs(abs(k) - c) < diff:
-                diff = abs(abs(k) - c)
+            if abs(k - c) < diff:
+                diff = abs(k - c)
                 key = k
         
         # Return empty string if no valid match found

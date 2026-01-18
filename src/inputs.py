@@ -14,6 +14,11 @@ Key functionality:
 - Statistical analysis of sequence properties
 """
 
+# Set matplotlib backend BEFORE importing pyplot
+# 'Agg' is a non-GUI backend that works in threads and headless environments
+import matplotlib
+matplotlib.use('Agg')
+
 from model import *
 from collections import Counter
 from scipy.special import gamma
@@ -24,19 +29,30 @@ from IPython.display import clear_output
 from qiskit.quantum_info import Statevector
 from qiskit_algorithms.utils import algorithm_globals
 
-# Extract training mode switch from command line arguments
+# Training mode switch is now parsed via argparse in ansatz.py
 # 0 = training mode, 1 = inference mode
-switch = int(sys.argv[-1])
+# (switch is imported from ansatz via model.py)
 
-# Create descriptive filename for this metal combination
-S = f"{metals}-{r}"
+# Print ESM configuration if enabled
+if esm_lambda_max > 0:
+    warmup_str = f", warmup={esm_warmup}" if esm_warmup is not None else ""
+    print(f"ESM loss enabled: lambda_max={esm_lambda_max}, K={esm_K}, model={esm_model_name}{warmup_str}")
+
+# Create descriptive filename including all parser variables for experiment tracking
+S = (f"{metals}_q{num_tot}_r{r}"
+     f"_mmd{lambda_mmd_max}_fid{lambda_fidelity_max}_esm{esm_lambda_max}"
+     f"_K{esm_K}_sub{esm_subset_size}_{esm_model_name}"
+     f"_warm{esm_warmup}_step{esm_step_interval}")
 
 # Create output directory for this experiment
 if not os.path.exists(f"{S}"):
     os.makedirs(f"{S}")
 
-# Concatenate all target sequence types for consistent naming
-metals = "".join(keys_target)
+# Note: 'metals' is now defined in ansatz.py as "".join(keys_target)
+# Draw the circuit with the custom font sizes
+circuit_drawer(qc_e, output='mpl', style="clifford", filename=f'{S}/qc_e.png')
+circuit_drawer(qc_ed, output='mpl', style="clifford", filename=f'{S}/qc_ed.png')
+circuit_drawer(qc_d, output='mpl', style="clifford", filename=f'{S}/qc_d.png')
 
 def cnts(seqs, folder='', seed=0, is_denovo=True):
     """

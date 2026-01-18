@@ -12,15 +12,93 @@ Key concepts:
 - Parameters: Trainable variables in the quantum circuits
 """
 
-import os, difflib, sys
+import os, difflib, sys, argparse
 folder_name=os.getcwd()
+
+# =============================================
+# COMMAND LINE ARGUMENT PARSING
+# =============================================
+
+parser = argparse.ArgumentParser(
+    description='QOBRA - Quantum Operator-Based Real-Amplitude Autoencoder',
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter
+)
+
+# Required positional arguments
+parser.add_argument('metals', nargs='+', type=str,
+                    help='Metal types to analyze (e.g., Ca Mg Zn)')
+
+# Quantum circuit parameters
+parser.add_argument('--num-qubits', '-q', type=int, default=9,
+                    help='Total number of qubits in the circuit')
+parser.add_argument('--reps', '-r', type=int, default=2,
+                    help='Number of repetitions/layers in the ansatz')
+
+# Loss function lambda weights (all default to 1.0)
+parser.add_argument('--lambda-mmd', type=float, default=1.0,
+                    help='Weight for MMD loss (encoder training, phase 1)')
+parser.add_argument('--lambda-fidelity', type=float, default=1.0,
+                    help='Weight for Fidelity loss (decoder training, phase 2)')
+parser.add_argument('--lambda-esm', type=float, default=1.0,
+                    help='Weight for ESM loss (decoder training, phase 2)')
+
+# ESM configuration
+parser.add_argument('--esm-k', type=int, default=32,
+                    help='Number of positions to mask per sequence for ESM')
+parser.add_argument('--esm-model', type=str, default='esm2_t6_8M_UR50D',
+                    help='ESM model name (e.g., esm2_t6_8M_UR50D, esm2_t33_650M_UR50D)')
+parser.add_argument('--warmup-esm', type=int, default=None,
+                    help='Number of iterations to linearly anneal ESM lambda from 0 to max (default: None = no warmup)')
+parser.add_argument('--esm-step-interval', type=int, default=None,
+                    help='Iterations to wait before turning on ESM lambda (0 -> MAX step function)')
+parser.add_argument('--esm-subset-size', type=int, default=100,
+                    help='Number of sequences to use for ESM loss computation (default: 100)')
+
+# Mode switch
+parser.add_argument('--mode', '-m', type=int, choices=[0, 1], default=0,
+                    help='0 = training mode, 1 = inference/generation mode')
+
+# De novo generation parameters
+parser.add_argument('--num-denovo', type=int, default=5,
+                    help='Number of de novo sequences to generate per seed folder (default: 5)')
+parser.add_argument('--sample-batches', type=int, default=100,
+                    help='Number of sample batches/seeds to generate (default: 100)')
+
+# Parse arguments
+args = parser.parse_args()
+
+# Extract parsed values
+keys_target = args.metals
+num_tot = args.num_qubits
+r = args.reps
+
+# Loss function weights (all default to 1.0)
+# Phase 1 (encoder training): MMD loss
+lambda_mmd_max = args.lambda_mmd
+
+# Phase 2 (decoder training): Fidelity + ESM losses
+lambda_fidelity_max = args.lambda_fidelity
+esm_lambda_max = args.lambda_esm
+
+# ESM configuration
+esm_K = args.esm_k
+esm_model_name = args.esm_model
+esm_warmup = args.warmup_esm  # Number of iterations for ESM lambda warmup (None = no warmup)
+esm_step_interval = args.esm_step_interval  # Iterations before ESM turns on (None = use linear warmup)
+
+# Mode switch
+switch = args.mode
+
+# De novo generation parameters
+num_denovo = args.num_denovo
+sample_batches = args.sample_batches
+esm_subset_size = args.esm_subset_size
+
+# Create descriptive name for metal combination (used in output paths)
+metals = "".join(keys_target)
 
 # Navigate to the training data directory where molecular sequence data is stored
 os.chdir('Training data')
-
-# Extract command line arguments for sequence types and quantum circuit parameters
-# keys_target: List of sequence types to analyze (e.g., ['Ca', 'Mg', 'Zn'] for metal-binding proteins)
-keys_target = sys.argv[1:-3]
 
 # Import quantum computing libraries
 from qiskit.circuit import Parameter, ParameterVector
@@ -30,10 +108,6 @@ from qiskit.circuit.parametertable import ParameterView
 from qiskit_machine_learning.circuit.library import RawFeatureVector
 from qiskit import ClassicalRegister, QuantumCircuit, QuantumRegister
 from qiskit.circuit.library import BlueprintCircuit, RealAmplitudes
-
-# Extract quantum circuit configuration from command line arguments
-r = int(sys.argv[-2])  # Number of repetitions/layers in the ansatz
-num_tot = int(sys.argv[-3])  # Total number of qubits
 num_trash = 0  # Number of unused qubits (currently 0)
 num_latent = num_tot - num_trash  # Number of qubits used for latent representation
 
@@ -79,12 +153,13 @@ def ansatz(num_qubits, r, prefix):
 # e: Encoder ansatz (transforms input sequences to latent representation)
 e = ansatz(num_tot, r, "e")
 # d: Decoder ansatz (transforms latent representation back to sequences)
-d = ansatz(num_tot, r, "d")
+# Decoder has INDEPENDENT parameters for two-phase training
+d = ansatz(num_tot, r, "d").inverse()
 
 # Create named parameters for encoder and decoder circuits
-# e_params: Parameters for the encoder circuit (trainable weights)
+# e_params: Parameters for the encoder circuit (trainable in phase 1)
 e_params = [Parameter(fr'$\epsilon_{{{i}}}$') for i in range(num_encode)]
-# d_params: Parameters for the decoder circuit (trainable weights)
+# d_params: Parameters for the decoder circuit (trainable in phase 2)
 d_params = [Parameter(fr'$\delta_{{{i}}}$') for i in range(num_decode)]
 
 # Note: n_params (noise parameters) are commented out - could be used for

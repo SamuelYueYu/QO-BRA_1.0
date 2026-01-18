@@ -4,11 +4,17 @@ QOBRA - Model Module
 This module defines the quantum circuit models used in the QOBRA system.
 It creates three main quantum circuits:
 1. Encoder model - Transforms molecular sequences into latent quantum states
-2. Decoder model - Reconstructs sequences from latent states
+2. Decoder model - Reconstructs sequences from latent states (INDEPENDENT PARAMETERS)
 3. Full model - Complete autoencoder for training (encoder + decoder)
 
 The quantum circuits use parameterized gates that are optimized during training
 to learn meaningful representations of molecular sequences and their functional patterns.
+
+TWO-PHASE TRAINING ARCHITECTURE:
+- Phase 1: Encoder trained on MMD loss (latent space matching)
+- Phase 2: Decoder trained on Fidelity + ESM losses (encoder frozen)
+- Encoder: Parameterized by xe (encoder parameters)
+- Decoder: Parameterized by xd (decoder parameters) - INDEPENDENT from encoder
 """
 
 import os, pickle
@@ -49,23 +55,25 @@ qc_e = qc_e.compose(e.assign_parameters(e_params))
 # The full model is used for training and includes both encoder and decoder
 # Architecture: Input → Encoder → Latent State → Decoder → Output
 # The goal is to reconstruct the input sequence through the quantum latent space
+#
+# NOTE: Decoder uses INDEPENDENT parameters (d_params)
 
-train_qc = QuantumCircuit(num_tot)  # Create training circuit
+qc_ed = QuantumCircuit(num_tot)  # Create training circuit
 
 # ENCODER PATH
 # Add input feature map to encode classical sequence data
-train_qc = train_qc.compose(fm_i.assign_parameters(i_params))
+qc_ed = qc_ed.compose(fm_i.assign_parameters(i_params))
 
 # Add encoder ansatz to compress information into latent space
-train_qc = train_qc.compose(e.assign_parameters(e_params))
+qc_ed = qc_ed.compose(e.assign_parameters(e_params))
 
 # Add barrier to separate encoder from decoder
-train_qc.barrier()
+qc_ed.barrier()
 
-# DECODER PATH
-# Add inverse encoder ansatz to reconstruct from latent space
-# Note: Using the same parameters as encoder but in reverse (inverse operation)
-train_qc = train_qc.compose(e.assign_parameters(e_params).inverse())
+# DECODER PATH (INDEPENDENT PARAMETERS)
+# Add decoder ansatz with its own parameters
+# Decoder is trained separately in phase 2
+qc_ed = qc_ed.compose(d.assign_parameters(d_params))
 
 # =============================================
 # DECODER MODEL DEFINITION
@@ -73,6 +81,8 @@ train_qc = train_qc.compose(e.assign_parameters(e_params).inverse())
 # The decoder generates new molecular sequences from quantum latent representations
 # It's used for de novo sequence generation after training
 # Architecture: Latent State → Decoder → Output Sequence
+#
+# NOTE: Decoder uses INDEPENDENT parameters (d_params)
 
 qc_d = QuantumCircuit(num_tot)  # Create decoder circuit
 
@@ -84,6 +94,6 @@ qc_d = qc_d.compose(fm_l.assign_parameters(l_params), range(num_latent))
 # Add barrier for visual clarity
 qc_d.barrier()
 
-# Add inverse encoder ansatz to generate sequences from latent space
-# Uses the trained encoder parameters in reverse to decode latent states
-qc_d = qc_d.compose(e.assign_parameters(e_params).inverse())
+# Add decoder ansatz with independent parameters
+# Uses trained decoder parameters (from phase 2)
+qc_d = qc_d.compose(d.assign_parameters(d_params))

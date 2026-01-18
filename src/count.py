@@ -19,7 +19,8 @@ acids as tokens but is designed for general molecular sequence applications.
 """
 
 from functools import partial
-from multiprocessing import Pool
+import torch
+import time
 
 from inputs import *
 from scipy.stats import norm
@@ -29,13 +30,26 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 # These create a well-structured Gaussian distribution in latent space
 mu, std = 0., 1/np.sqrt(1.5*dim_tot)  # Mean=0, std scaled by quantum dimension
 
+# GPU device for target generation
+_target_device = None
+
+def get_target_device():
+    """Get the device for target generation (GPU if available)."""
+    global _target_device
+    if _target_device is None:
+        if torch.cuda.is_available():
+            _target_device = torch.device("cuda")
+        else:
+            _target_device = torch.device("cpu")
+    return _target_device
+
 def make_target(n, mu, std):
     """
-    Generate target distribution samples for training the quantum encoder.
+    GPU-accelerated target distribution sampling.
     
     This function creates samples from a multivariate Gaussian distribution
-    that serves as the target for the latent space. The distribution is
-    carefully constructed to lie on the unit sphere (valid quantum states).
+    that serves as the target for the latent space. Uses GPU batch sampling
+    with rejection for efficiency.
     
     The first component is always positive (representing the "head" amplitude),
     while the remaining components follow a Gaussian distribution. This structure
@@ -49,27 +63,34 @@ def make_target(n, mu, std):
     Returns:
     - Array of target latent space samples (n × dim_latent)
     """
+    device = get_target_device()
+    
     target = []
-    np.random.seed(4)  # Ensure reproducible target generation
+    batch_size = n * 3  # Oversample to account for rejections
     
-    # Generate samples until we have enough valid ones
     while len(target) < n:
-        # Generate (dim_latent-1) random values from Gaussian distribution
-        t = np.random.normal(mu, std, dim_latent-1)
+        # Generate large batch of samples on GPU
+        t = torch.randn(batch_size, dim_latent - 1, device=device) * std + mu
         
-        # Calculate the norm of the tail components
-        A = np.linalg.norm(t)
-
-        # Ensure the sample lies within the unit sphere
-        if A < 1:
-            # Calculate the head component to ensure unit norm
-            h = np.sqrt(1 - A**2)
+        # Calculate norms of tail components
+        norms = torch.linalg.norm(t, dim=1)
+        
+        # Reject samples outside unit sphere
+        valid_mask = norms < 1
+        valid_t = t[valid_mask]
+        
+        if valid_t.shape[0] > 0:
+            # Calculate head components to ensure unit norm
+            valid_norms = torch.linalg.norm(valid_t, dim=1)
+            heads = torch.sqrt(1 - valid_norms ** 2)
             
-            # Create complete target vector [head, tail_components]
-            t = np.array([h] + list(t))
-            target.append(t)
+            # Create complete target vectors [head, tail_components]
+            samples = torch.cat([heads.unsqueeze(1), valid_t], dim=1)
+            
+            # Move to CPU and convert to numpy
+            target.extend(samples.cpu().numpy())
     
-    return np.array(target)
+    return np.array(target[:n])
 
 # =============================================
 # QUANTUM AMPLITUDE MAPPING SYSTEM
@@ -95,18 +116,37 @@ F.write(f"{ctf}")
 F.close()
 
 # =============================================
-# ENCODER PARAMETER INITIALIZATION
+# ENCODER AND DECODER PARAMETER INITIALIZATION
 # =============================================
-# Initialize or load encoder parameters based on training mode
+# Initialize or load encoder AND decoder parameters based on training mode
+# TWO-PHASE TRAINING: Encoder and decoder have INDEPENDENT parameters
 
 if switch == 0:
     # Training mode: Initialize with random parameters
     algorithm_globals.random_seed = 42
     xe = algorithm_globals.random.random(e.num_parameters)
+    
+    # Initialize decoder with different random seed
+    algorithm_globals.random_seed = 43
+    xd = algorithm_globals.random.random(d.num_parameters)
+    
+    print(f"Initialized {len(xe)} encoder + {len(xd)} decoder parameters")
 else:
     # Inference mode: Load pre-trained parameters
     with open(f'{S}/opt-e-{S}.pkl', 'rb') as F:
         xe = pickle.load(F)
+    
+    # Load decoder parameters
+    decoder_file = f'{S}/opt-d-{S}.pkl'
+    if os.path.exists(decoder_file):
+        with open(decoder_file, 'rb') as F:
+            xd = pickle.load(F)
+        print(f"Loaded encoder and decoder parameters from {S}/")
+    else:
+        # Fallback: initialize decoder randomly
+        algorithm_globals.random_seed = 43
+        xd = algorithm_globals.random.random(d.num_parameters)
+        print(f"Loaded encoder parameters, initialized decoder randomly")
 
 # =============================================
 # TOKEN FREQUENCY VISUALIZATION
@@ -144,111 +184,194 @@ ax.set_xlabel("Token values", fontsize=16)
 ax.set_ylabel("Frequency", fontsize=16)
 fig.savefig(f"{S}/tokens-{metals}.png", dpi=300, bbox_inches='tight')
 
-def output(seqs, h, Set):
+def output(seqs, h, Set, encoder_params=None, decoder_params=None):
     """
     Evaluate sequence reconstruction performance of the trained autoencoder.
     
-    This function tests how well the quantum autoencoder can reconstruct input
-    molecular sequences. It processes sequences through the full autoencoder
-    (input → encoder → decoder → output) and measures reconstruction quality.
-    
-    The evaluation includes:
-    - Sequence-by-sequence reconstruction comparison
-    - Overall reconstruction success rate
-    - Detailed similarity analysis
+    OPTIMIZED VERSION:
+    - Batch unitary computation (compute autoencoder unitary once)
+    - GPU-accelerated matrix multiplication for all sequences
+    - Multiprocessing for sequence decoding
     
     Parameters:
     - seqs: List of molecular sequences to evaluate
     - h: Head amplitude for normalization
     - Set: Dataset name (e.g., "Train", "Test")
+    - encoder_params: Trained encoder parameters (if None, uses module-level xe)
+    - decoder_params: Trained decoder parameters (if None, uses module-level xd)
     """
-    # Open output files for results
-    file = open(f"{S}/Results-{S}.txt", "a")    # Summary results
-    file1 = open(f"{S}/R-{S}.txt", "a")         # Detailed results
+    import torch
+    from qiskit.quantum_info import Operator
+    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+    import multiprocessing as mp
     
-    match, success_rate = 0, 0  # Initialize performance counters
+    # Use provided parameters or fall back to module-level globals
+    p_encoder = encoder_params if encoder_params is not None else xe
+    p_decoder = decoder_params if decoder_params is not None else xd
     
-    # Create quantum circuits for evaluation
-    # Input circuit (just the feature map)
-    qc_i = QuantumCircuit(num_tot)
-    qc_i = qc_i.compose(fm_i.assign_parameters(i_params))
+    print(f"\nEvaluating {Set} set ({len(seqs)} sequences)...")
+    start_time = time.time()
     
-    # Full autoencoder circuit (input → encoder → decoder → output)
-    qc_o = QuantumCircuit(num_tot)
-    qc_o = qc_o.compose(fm_i.assign_parameters(i_params))      # Input encoding
-    qc_o = qc_o.compose(e.assign_parameters(e_params))         # Encoder
-    qc_o = qc_o.compose(e.assign_parameters(e_params).inverse()) # Decoder
+    # ============================================
+    # BATCH ENCODE ALL SEQUENCES
+    # ============================================
+    print("  Encoding sequences...")
+    states = np.array([
+        encode_amino_acid_sequence(seq, ctf=ctf, head=h, 
+                                   max_len=max_len, vec_len=dim_tot)
+        for seq in seqs
+    ])
     
-    # Prepare encoding function for parallel processing
-    f = partial(encode_amino_acid_sequence, ctf=ctf, 
-                head=h, max_len=max_len, vec_len=dim_tot)
+    # ============================================
+    # COMPUTE AUTOENCODER UNITARY (ONCE)
+    # ============================================
+    # The autoencoder uses INDEPENDENT encoder and decoder parameters
+    # Autoencoder = Decoder @ Encoder
+    print("  Computing encoder and decoder unitaries...")
     
-    # Encode all sequences in parallel
-    with Pool(processes=processes) as pool:
-        states = np.array(pool.map(f, seqs))
+    # Get encoder unitary
+    encoder_circuit_params = list(e.parameters)
+    encoder_dict = {encoder_circuit_params[j]: p_encoder[j] for j in range(len(encoder_circuit_params))}
+    encoder_circuit = e.assign_parameters(encoder_dict)
+    U_encoder = Operator(encoder_circuit).data
     
-    # Evaluate each sequence individually
-    for i in states:
-        # ============================================
-        # PROCESS INPUT SEQUENCE
-        # ============================================
-        # Create parameter dictionary for input
-        param_dict = {i_params[j]: i[j] for j in range(num_feature)}
-        
-        # Execute input circuit (ground truth)
-        original = qc_i.assign_parameters(param_dict)
-        i_sv = Statevector(original).data**2  # Get probability amplitudes
-        
-        # ============================================
-        # PROCESS THROUGH AUTOENCODER
-        # ============================================
-        # Add encoder parameters to parameter dictionary
-        param_dict.update({e_params[j]: xe[j] for j in range(num_encode)})
-        
-        # Execute full autoencoder circuit
-        output = qc_o.assign_parameters(param_dict)
-        o_sv = Statevector(output).data**2  # Get output probability amplitudes
-        
-        # ============================================
-        # DECODE AND COMPARE SEQUENCES
-        # ============================================
-        # Decode both input and output back to amino acid sequences
-        original_seq = decode_amino_acid_sequence(np.sqrt(i_sv), ftc, h)
-        output_seq = decode_amino_acid_sequence(np.sqrt(o_sv), ftc, h)
-        
-        # Find sequence terminators for proper comparison
+    # Get decoder unitary (INDEPENDENT parameters)
+    decoder_circuit_params = list(d.parameters)
+    decoder_dict = {decoder_circuit_params[j]: p_decoder[j] for j in range(len(decoder_circuit_params))}
+    decoder_circuit = d.assign_parameters(decoder_dict)
+    U_decoder = Operator(decoder_circuit).data
+    
+    # Autoencoder unitary: U_decoder @ U_encoder
+    U_autoencoder = U_decoder @ U_encoder
+    
+    # ============================================
+    # BATCH MATRIX MULTIPLICATION (GPU)
+    # ============================================
+    print("  Applying autoencoder (batch GPU)...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Move to GPU
+    states_t = torch.tensor(states, device=device, dtype=torch.complex64)
+    U_t = torch.tensor(U_autoencoder, device=device, dtype=torch.complex64)
+    
+    # Batch apply autoencoder: output = input @ U^T
+    output_states = (states_t @ U_t.T).cpu().numpy()
+    
+    # Input states are just the original (no transformation needed)
+    input_states = states
+    
+    # ============================================
+    # PARALLEL DECODING WITH MULTIPROCESSING
+    # ============================================
+    print("  Decoding sequences (parallel)...")
+    
+    # Prepare data for parallel processing
+    decode_args = [
+        (np.real(input_states[i]), np.real(output_states[i]), ftc, h, dim_tot)
+        for i in range(len(seqs))
+    ]
+    
+    # Use ThreadPoolExecutor for I/O-bound decoding (GIL-friendly for dict lookups)
+    num_workers = min(mp.cpu_count(), 16)
+    
+    results = []
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        results = list(executor.map(_decode_and_compare, decode_args))
+    
+    # ============================================
+    # WRITE RESULTS
+    # ============================================
+    print("  Writing results...")
+    file = open(f"{S}/Results-{S}.txt", "a")
+    file1 = open(f"{S}/R-{S}.txt", "a")
+    
+    success_count = 0
+    for original_seq, output_seq, ratio in results:
+        # Find sequence terminators
         idx1 = original_seq.find("X")
         idx2 = output_seq.find("X")
         
-        # Write sequences to detailed results file
+        # Write sequences
         if idx1 != -1:
-            file1.write(f"I: {original_seq[:idx1]}\n")  # Input (truncated at X)
+            file1.write(f"I: {original_seq[:idx1]}\n")
         else:
-            file1.write(f"I: {original_seq}\n")         # Input (full sequence)
+            file1.write(f"I: {original_seq}\n")
             
         if idx2 != -1:
-            file1.write(f"O: {output_seq[:idx2]}\n")    # Output (truncated at X)
+            file1.write(f"O: {output_seq[:idx2]}\n")
         else:
-            file1.write(f"O: {output_seq}\n")           # Output (full sequence)
+            file1.write(f"O: {output_seq}\n")
         
-        # ============================================
-        # CALCULATE SIMILARITY METRICS
-        # ============================================
-        # Measure similarity between input and output sequences
-        ratio = seq_match_ratio(original_seq, output_seq)
         file1.write(f"Sequence ratio of correct matches: {ratio}\n")
-        file1.write("*" * dim_tot + '\n')  # Add separator
+        file1.write("*" * dim_tot + '\n')
         
-        # Count perfect reconstructions
         if ratio == 1:
-            success_rate += 1
+            success_count += 1
     
-    # Calculate overall success rate
-    success_rate /= len(seqs)
-    
-    # Write summary results
+    success_rate = success_count / len(seqs)
     file.write(f"{Set}\t{len(seqs)}\t{success_rate:.3f}\n")
     
-    # Close output files
     file.close()
     file1.close()
+    
+    elapsed = time.time() - start_time
+    print(f"  Completed in {elapsed:.2f}s (success rate: {success_rate:.3f})")
+
+
+def _decode_and_compare(args):
+    """
+    Helper function for parallel decoding.
+    Decodes input and output states and computes similarity.
+    
+    Parameters:
+    - args: Tuple of (input_state, output_state, ftc, head, dim_tot)
+    
+    Returns:
+    - Tuple of (original_seq, output_seq, similarity_ratio)
+    """
+    input_state, output_state, ftc, h, dim_tot = args
+    
+    # Decode both states to sequences
+    original_seq = _decode_sequence(input_state, ftc, h, dim_tot)
+    output_seq = _decode_sequence(output_state, ftc, h, dim_tot)
+    
+    # Calculate similarity
+    ratio = seq_match_ratio(original_seq, output_seq)
+    return original_seq, output_seq, ratio
+
+
+def _decode_sequence(code, ftc, h, dim_tot):
+    """
+    Decode a quantum state vector to amino acid sequence.
+    Optimized version of decode_amino_acid_sequence for parallel execution.
+    
+    Parameters:
+    - code: State vector (real part)
+    - ftc: Frequency to character mapping
+    - h: Head amplitude
+    - dim_tot: Dimension of state vector
+    
+    Returns:
+    - Decoded amino acid sequence string
+    """
+    ret = ""
+    
+    # Handle edge case
+    if abs(code[0]) < 1e-10:
+        return ""
+    
+    factor = h / code[0]
+    ftc_keys = np.array(list(ftc.keys()))
+    
+    for i in range(1, dim_tot):
+        key_val = code[i] * factor
+        
+        # Find closest matching amplitude using vectorized operation
+        diffs = np.abs(ftc_keys - key_val)
+        min_idx = np.argmin(diffs)
+        key = ftc_keys[min_idx]
+        
+        if key not in ftc:
+            return ""
+        ret += ftc[key]
+    return ret

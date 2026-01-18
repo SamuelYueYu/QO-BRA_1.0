@@ -1,116 +1,237 @@
 """
 QOBRA - Training Module
 
-This module implements the training process for the QOBRA quantum autoencoder.
-It optimizes the encoder parameters to learn meaningful representations of molecular
-sequences with functional patterns. The current implementation demonstrates on
-protein sequences but is designed for general molecular applications.
+This module implements TWO-PHASE training for the QOBRA quantum autoencoder:
 
-The training process:
-1. Uses COBYLA optimizer to minimize the encoder loss
-2. Trains on molecular sequences with functional annotations
-3. Evaluates performance on both training and test sets
-4. Saves trained parameters and generates performance reports
+PHASE 1 - ENCODER TRAINING:
+- Loss: MMD only (latent space matching to Gaussian)
+- Optimizes encoder parameters
+- Goal: Learn encoder that maps inputs to well-structured latent space
 
-Key optimization: The encoder is trained to map molecular sequences to a target
-latent distribution, enabling generation of novel sequences with similar properties.
+PHASE 2 - DECODER TRAINING:
+- Loss: Fidelity + ESM (reconstruction + biological plausibility)
+- Encoder FROZEN, optimizes decoder parameters
+- Goal: Learn decoder that reconstructs biologically valid sequences
+
+ARCHITECTURE:
+- Encoder: Parameterized by xe, maps input → latent space
+- Decoder: Parameterized by xd (INDEPENDENT), maps latent space → output
+
+OPTIMIZATIONS APPLIED:
+1. Pre-computed sequence encodings (one-time cost before training)
+2. Batch unitary matrix multiplication (GPU-accelerated)
+3. Reduced ESM loss computation frequency
+4. Cached target distribution
+5. Mini-batching for faster iterations
 """
+
+# Set matplotlib backend BEFORE any imports (must be first)
+# 'Agg' is a non-GUI backend that works in threads and headless environments
+import matplotlib
+matplotlib.use('Agg')
 
 from cost import *
 from scipy.optimize import minimize
 from qiskit_algorithms.optimizers import COBYLA
 
 # =============================================
-# ENCODER TRAINING PROCESS
+# PRE-COMPUTATION PHASE (ONE-TIME COST)
 # =============================================
-# Train the quantum encoder to learn optimal representations of molecular sequences
 
-# Record training start time for performance tracking
-start = time.time()
+print("=" * 60)
+print("QOBRA Two-Phase Training")
+print("=" * 60)
+print(f"Training samples: {len(train_seqs)}")
+print(f"Test samples: {len(test_seqs)}")
+print(f"Qubits: {num_tot}, Dimension: {dim_tot}")
+print("-" * 60)
+print("Parameters:")
+print(f"  Encoder: {num_encode} parameters")
+print(f"  Decoder: {num_decode} parameters (independent)")
+print("-" * 60)
+print(f"Phase 1 (Encoder): λ_MMD = {LAMBDA_MMD}")
+print(f"Phase 2 (Decoder): λ_Fidelity = {LAMBDA_FIDELITY}, λ_ESM = {LAMBDA_ESM}")
+print("-" * 60)
+print("Optimization settings:")
+if MINI_BATCH_ENABLED:
+    n_batches_per_epoch = int(np.ceil(len(train_seqs) / MINI_BATCH_SIZE))
+    print(f"  Mini-batching: {MINI_BATCH_SIZE} samples/batch")
+    print(f"  Batches/epoch: {n_batches_per_epoch}")
+else:
+    print(f"  Mini-batching: disabled")
+print(f"  Max epochs (encoder): {MAX_EPOCHS_ENCODER}")
+print(f"  Max epochs (decoder): {MAX_EPOCHS_DECODER}")
+print(f"  Test loss frequency: every {TEST_COMPUTE_FREQUENCY} iterations")
+print(f"  Plot frequency: every {PLOT_FREQUENCY} iterations")
+if LAMBDA_ESM > 0:
+    print(f"  ESM frequency: every {ESM_COMPUTE_FREQUENCY} iterations")
+print("=" * 60)
 
-# Initialize COBYLA optimizer
-# COBYLA (Constrained Optimization BY Linear Approximation) is well-suited for
-# quantum parameter optimization as it doesn't require gradient information
-opt = COBYLA(maxiter=500)  # Maximum 500 iterations to prevent overtraining
-print("Encoder training")
+# Pre-compute encoded states
+precompute_encoded_states(train_seqs, test_seqs)
 
-# Create partial function for loss computation
-# This binds the training and test data to the loss function, leaving only
-# the parameters to be optimized
-f = partial(e_loss, train_input=train_seqs, test_input=test_seqs)
+# Initialize epoch-based batch iterator
+if MINI_BATCH_ENABLED:
+    init_batch_iterator(len(train_seqs), batch_size=MINI_BATCH_SIZE, seed=42)
 
-# Optimize encoder parameters
-# The optimizer minimizes the loss function by adjusting encoder parameters
-# xe contains the initial parameter values (random or from previous training)
-opt_result = opt.minimize(fun=f, x0=xe)
+# Pre-generate target distribution
+print("Pre-generating target distribution...")
+_ = get_cached_target(len(train_seqs), mu, std)
+print("Target distribution cached.")
 
 # =============================================
-# SAVE TRAINED PARAMETERS
+# PHASE 1: ENCODER TRAINING (MMD ONLY)
 # =============================================
-# Store the optimized encoder parameters for future use
 
-# Extract optimized parameters from the optimization result
-xe = opt_result.x
+print("\n" + "=" * 60)
+print("PHASE 1: ENCODER TRAINING (MMD Loss)")
+print("=" * 60)
+print(f"Loss: L = {LAMBDA_MMD} * L_MMD")
+print(f"Optimizing {num_encode} encoder parameters")
+print("-" * 60)
 
-# Save parameters to pickle file for persistence
-# This allows the trained model to be reused for generation or further training
+start_phase1 = time.time()
+
+# Initialize encoder optimizer
+opt_encoder = COBYLA(maxiter=MAX_EPOCHS_ENCODER)
+
+# Initialize progress bar for phase 1
+print()
+pbar = init_progress_bar(max_epochs=MAX_EPOCHS_ENCODER)
+
+# Create partial function for encoder loss
+f_encoder = partial(encoder_loss, train_input=train_seqs, test_input=test_seqs)
+
+# Optimize encoder
+try:
+    encoder_result = opt_encoder.minimize(fun=f_encoder, x0=xe)
+finally:
+    close_progress_bar()
+
+print()
+
+# Extract optimized encoder parameters
+xe_opt = encoder_result.x
+
+# Save encoder parameters
 with open(f'{S}/opt-e-{S}.pkl', 'wb') as F:
-    pickle.dump(xe, F)
+    pickle.dump(xe_opt, F)
 
-# Calculate and report training time
-elapsed_e = (time.time() - start) / 3600  # Convert to hours
-print(f"Fit in {elapsed_e:0.2f} h")
+elapsed_phase1 = (time.time() - start_phase1) / 3600
+print(f"Phase 1 completed in {elapsed_phase1:.2f} h")
+print(f"Saved encoder parameters to {S}/opt-e-{S}.pkl")
+
+# =============================================
+# PHASE 2: DECODER TRAINING (FIDELITY + ESM)
+# =============================================
+
+print("\n" + "=" * 60)
+print("PHASE 2: DECODER TRAINING (Fidelity + ESM)")
+print("=" * 60)
+print(f"Loss: L = {LAMBDA_FIDELITY} * L_Fidelity + {LAMBDA_ESM} * L_ESM")
+print(f"Encoder FROZEN, optimizing {num_decode} decoder parameters")
+print("-" * 60)
+
+start_phase2 = time.time()
+
+# Freeze the encoder with optimized parameters
+set_frozen_encoder(xe_opt)
+
+# Compute ESM baseline on ALL original training sequences (one-time cost)
+if LAMBDA_ESM_MAX > 0:
+    from losses import compute_esm_baseline
+    esm_baseline = compute_esm_baseline(
+        train_seqs, 
+        K=esm_K, 
+        model_name=esm_model_name
+    )
+    print(f"ESM baseline established: {esm_baseline:.4f}")
+    print("-" * 60)
+
+# Reset batch iterator for phase 2
+if MINI_BATCH_ENABLED:
+    init_batch_iterator(len(train_seqs), batch_size=MINI_BATCH_SIZE, seed=43)
+
+# Reset decoder loss tracking
+reset_decoder_tracking()
+
+# Initialize decoder optimizer
+opt_decoder = COBYLA(maxiter=MAX_EPOCHS_DECODER)
+
+# Initialize progress bar for phase 2
+print()
+pbar = init_progress_bar(max_epochs=MAX_EPOCHS_DECODER)
+
+# Create partial function for decoder loss
+f_decoder = partial(decoder_loss, train_input=train_seqs, test_input=test_seqs)
+
+# Optimize decoder
+try:
+    decoder_result = opt_decoder.minimize(fun=f_decoder, x0=xd)
+finally:
+    close_progress_bar()
+
+print()
+
+# Extract optimized decoder parameters
+xd_opt = decoder_result.x
+
+# Save decoder parameters
+with open(f'{S}/opt-d-{S}.pkl', 'wb') as F:
+    pickle.dump(xd_opt, F)
+
+elapsed_phase2 = (time.time() - start_phase2) / 3600
+print(f"Phase 2 completed in {elapsed_phase2:.2f} h")
+print(f"Saved decoder parameters to {S}/opt-d-{S}.pkl")
+
+# Update global parameters
+xe = xe_opt
+xd = xd_opt
 
 # =============================================
 # PERFORMANCE EVALUATION
 # =============================================
-# Evaluate the trained encoder on training and test sets
 
-# Record evaluation start time
-start = time.time()
+print("\n" + "=" * 60)
+print("EVALUATION")
+print("=" * 60)
+
+start_eval = time.time()
 
 # Initialize results file
-# This file will contain performance metrics for different datasets
 file = open(f"{S}/Results-{S}.txt", "w")
-file.write("Dataset\tSize\tR\n")  # Header: Dataset name, size, reconstruction accuracy
+file.write("Dataset\tSize\tR\n")
 file.close()
 
 # =============================================
 # TRAINING SET EVALUATION
 # =============================================
-# Evaluate how well the encoder reconstructs training sequences
 
-# Initialize detailed results file
 file = open(f"{S}/R-{S}.txt", "w")
 file.write("TRAINING SET\n")
 file.close()
 
-# Generate detailed reconstruction results for training set
-# This function compares input sequences with their reconstructions
-# and calculates similarity metrics
-output(train_seqs, head, "Train")
+output(train_seqs, head, "Train", encoder_params=xe, decoder_params=xd)
 
 # =============================================
 # TEST SET EVALUATION
 # =============================================
-# Evaluate generalization performance on unseen test sequences
 
-# Add test set section to results file
 file = open(f"{S}/R-{S}.txt", "a")
 file.write("TEST SET\n")
 file.close()
 
-# Generate detailed reconstruction results for test set
-# This evaluates how well the model generalizes to new sequences
-output(test_seqs, head, "Test")
+output(test_seqs, head, "Test", encoder_params=xe, decoder_params=xd)
 
 # =============================================
 # FINAL PERFORMANCE REPORTING
 # =============================================
-# Calculate and report total training and evaluation time
 
-elapsed_p = (time.time() - start) / 60  # Convert to minutes
-print(f"Printed in {elapsed_p:.2f} min")
+elapsed_eval = (time.time() - start_eval) / 60
+print(f"\nEvaluation completed in {elapsed_eval:.2f} min")
 
-# Report total time for the entire training process
-print(f"Finished in {elapsed_e + elapsed_p/60:.2f} h")
+total_time = elapsed_phase1 + elapsed_phase2 + elapsed_eval/60
+print(f"\nTotal training time: {total_time:.2f} h")
+print(f"  Phase 1 (Encoder): {elapsed_phase1:.2f} h")
+print(f"  Phase 2 (Decoder): {elapsed_phase2:.2f} h")
+print(f"  Evaluation: {elapsed_eval:.2f} min")
