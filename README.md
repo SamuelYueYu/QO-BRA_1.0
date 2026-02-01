@@ -1,4 +1,4 @@
-# Q-OBRA - Quantum Operator-Based Real-Amplitude Autoencoder
+# QO-BRA - Quantum Operator-Based Real-Amplitude Autoencoder
 
 A quantum machine learning framework for generating biologically plausible protein sequences. QOBRA combines variational quantum circuits with ESM (Evolutionary Scale Modeling) loss to generate novel protein sequences that match the statistical properties of natural proteins.
 
